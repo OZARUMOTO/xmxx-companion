@@ -38,25 +38,20 @@ if [ "${FREE_GB:-0}" -lt 70 ]; then
   exit 1
 fi
 
-echo "==> [2/6] installing monerod"
-if command -v monerod >/dev/null 2>&1; then
-  echo "    monerod already installed: $(command -v monerod)"
-elif command -v nix >/dev/null 2>&1; then
-  echo "    installing via nix binary cache..."
-  nix profile install nixpkgs#monero || { echo "    nix install failed, trying apt..."; sudo apt-get update -y && sudo apt-get install -y monero; }
-  command -v monerod || export PATH="$HOME/.nix-profile/bin:$PATH"
-  command -v monerod || { echo "error: monerod not on PATH after install"; exit 1; }
+echo "==> [2/6] installing monerod (official binary — apt's is ancient, nixpkgs flake lacks it)"
+if [ -x /usr/local/bin/monerod ] && /usr/local/bin/monerod --version | grep -qE "v0\.1[89]"; then
+  echo "    monerod already installed (modern): $(/usr/local/bin/monerod --version | head -1)"
 else
-  echo "    installing via apt..."
-  sudo apt-get update -y && sudo apt-get install -y monero
-  command -v monerod || { echo "error: monerod not on PATH after apt install"; exit 1; }
-fi
-MONEROD_BIN=$(command -v monerod)
-# The unit runs monerod as the 'monero' user, who cannot traverse a 0750
-# home dir — copy the binary to /usr/local/bin so it is world-readable.
-if [ "$MONEROD_BIN" != "/usr/local/bin/monerod" ]; then
-  sudo cp "$MONEROD_BIN" /usr/local/bin/monerod
-  echo "    copied monerod to /usr/local/bin/monerod"
+  # apt's monerod (0.18.4.5+~2020) predates get_blocks_by_height etc. and is
+  # unusable for this companion. Always fetch the official current release.
+  TAG=$(curl -s https://api.github.com/repos/monero-project/monero/releases/latest | grep -oE '"tag_name": "[^"]+"' | head -1 | grep -oE 'v[0-9.]+')
+  echo "    latest release: $TAG"
+  curl -sL -o /tmp/monero.tar.bz2 "https://downloads.getmonero.org/cli/monero-linux-x64-${TAG}.tar.bz2"
+  cd /tmp && tar xjf monero.tar.bz2
+  NEWBIN=$(find /tmp -maxdepth 2 -name monerod -type f | head -1)
+  [ -n "$NEWBIN" ] || { echo "error: monerod not found in official tarball"; exit 1; }
+  sudo cp "$NEWBIN" /usr/local/bin/monerod
+  echo "    installed: $(/usr/local/bin/monerod --version | head -1)"
 fi
 echo "    monerod: /usr/local/bin/monerod"
 

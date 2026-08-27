@@ -66,11 +66,19 @@ scp /Volumes/AIRLOCK/xmxx-viewkey.txt mikegotbtc@<box>:~/xmxx-viewkey.txt
 bash deploy/deploy-box.sh ~/xmxx-viewkey.txt
 ```
 
-That installs monerod (nix binary cache), builds the companion (native ELF),
-installs the units in `deploy/`, and starts `monerod` + `xmxx-companion`.
-The pruned sync runs unattended in the background; the companion page comes
-up immediately and re-syncs on every load. (On this box, 8787/8788 are
-taken by `surf-relay`, so the companion uses **8789**.)
+That installs the **official current monerod** (downloaded from
+getmonero.org — apt's monero package is an ancient snapshot that lacks the
+modern RPC methods), builds the companion (native ELF), installs the units
+in `deploy/`, and starts `monerod` + `xmxx-companion`. The pruned sync runs
+unattended in the background; the companion page comes up immediately and
+re-syncs on every load. (On this box, 8787/8788 are taken by `surf-relay`,
+so the companion uses **8789**.)
+
+Note: while the node is still syncing toward the RingCT hardfork height
+(~1,009,827), `get_output_distribution` for amount 0 legitimately errors
+(`-5 Failed to get output distribution`) — the companion logs it as a
+non-fatal initial-sync warning and succeeds automatically once the node
+passes that height.
 
 ## Endpoints
 
