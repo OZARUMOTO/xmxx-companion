@@ -68,6 +68,26 @@ impl DaemonRpc {
         v.get("result").cloned().ok_or_else(|| anyhow!("rpc {method}: no result"))
     }
 
+    /// POST JSON to a daemon URI endpoint (e.g. `/get_transactions`).
+    ///
+    /// Since 0.18.x, monerod serves the tx-level methods as URI endpoints
+    /// (`/get_transactions`, `/get_outs`, `/send_raw_transaction`, ...)
+    /// rather than in the `/json_rpc` map — calling them via `/json_rpc`
+    /// returns "Method not found".
+    fn post_uri(&self, uri: &str, body: Value) -> anyhow::Result<Value> {
+        let resp = self
+            .inner
+            .agent
+            .post(&format!("{}{}", self.inner.url, uri))
+            .send_json(body)
+            .map_err(|e| anyhow!("rpc {uri}: {e}"))?;
+        let v: Value = resp.into_json().map_err(|e| anyhow!("rpc {uri}: bad json: {e}"))?;
+        if let Some(err) = v.get("error") {
+            return Err(anyhow!("rpc {uri} error: {err}"));
+        }
+        v.get("result").cloned().ok_or_else(|| anyhow!("rpc {uri}: no result"))
+    }
+
     /// get_block_count → the number of the latest block (count - 1).
     pub fn latest_block_number_(&self) -> anyhow::Result<usize> {
         let res = self.post("get_block_count", json!({}))?;
@@ -75,33 +95,28 @@ impl DaemonRpc {
         Ok(count.saturating_sub(1) as usize)
     }
 
-    /// get_blocks_by_height → (block, pruned txs) for a range.
+    /// (block, pruned txs) for a range.
+    ///
+    /// 0.18.x daemons serve `get_blocks_by_height` only as a *binary*
+    /// endpoint (`/get_blocks_by_height.bin`), so we assemble each range
+    /// from `get_block` (JSON, per height — returns the block blob with tx
+    /// hashes) plus `get_transactions` (URI endpoint).
     fn blocks_by_height_(
         &self,
         start: usize,
         end: usize,
     ) -> anyhow::Result<Vec<(Block, Vec<Transaction<Pruned>>)>> {
-        let res = self
-            .post("get_blocks_by_height", json!({ "start_height": start, "end_height": end }))?;
-        let blocks = res["blocks"]
-            .as_array()
-            .ok_or_else(|| anyhow!("get_blocks_by_height: no blocks"))?;
-        let mut out = Vec::with_capacity(blocks.len());
-        for b in blocks {
-            let blob_hex = b["blob"].as_str().ok_or_else(|| anyhow!("block: no blob"))?;
-            let blob = hex::decode(blob_hex).map_err(|e| anyhow!("block blob hex: {e}"))?;
-            let mut slice: &[u8] = &blob;
-            let block = Block::read(&mut slice).map_err(|e| anyhow!("block parse: {e}"))?;
-            let mut txs = Vec::new();
-            if let Some(tx_list) = b["transactions"].as_array() {
-                for tx_hex in tx_list {
-                    let tx_hex = tx_hex.as_str().ok_or_else(|| anyhow!("tx not str"))?;
-                    let tx_bytes = hex::decode(tx_hex).map_err(|e| anyhow!("tx hex: {e}"))?;
-                    let mut tslice: &[u8] = &tx_bytes;
-                    let tx = Transaction::<Pruned>::read(&mut tslice)
-                        .map_err(|e| anyhow!("tx parse: {e}"))?;
-                    txs.push(tx);
-                }
+        let mut out = Vec::with_capacity(end.saturating_sub(start) + 1);
+        for height in start..=end {
+            let block = self.block_(json!({ "height": height }))?;
+            let hashes = block.transactions.clone();
+            let raw = self.txs_(&hashes, true)?;
+            let mut txs = Vec::with_capacity(raw.len());
+            for (bytes, _) in raw {
+                let mut slice: &[u8] = &bytes;
+                let tx = Transaction::<Pruned>::read(&mut slice)
+                    .map_err(|e| anyhow!("tx parse: {e}"))?;
+                txs.push(tx);
             }
             out.push((block, txs));
         }
@@ -119,8 +134,8 @@ impl DaemonRpc {
             return Ok(vec![]);
         }
         let hashes_hex: Vec<String> = hashes.iter().map(hex::encode).collect();
-        let res = self.post(
-            "get_transactions",
+        let res = self.post_uri(
+            "/get_transactions",
             json!({ "txs_hashes": hashes_hex, "prune": prune, "split": true }),
         )?;
         let txs = res["txs"].as_array().ok_or_else(|| anyhow!("get_transactions: no txs"))?;
@@ -167,7 +182,7 @@ impl DaemonRpc {
         }
         let outputs: Vec<Value> =
             indexes.iter().map(|i| json!({ "index": i, "txid": true })).collect();
-        let res = self.post("get_outs", json!({ "outputs": outputs }))?;
+        let res = self.post_uri("/get_outs", json!({ "outputs": outputs }))?;
         let outs = res["outs"].as_array().ok_or_else(|| anyhow!("get_outs: no outs"))?;
         let mut out = Vec::with_capacity(outs.len());
         for o in outs {
@@ -539,7 +554,7 @@ impl monero_wallet::interface::PublishTransaction for DaemonRpc {
         let blob = transaction.serialize();
         async move {
             let res = self
-                .post("send_raw_transaction", json!({ "tx_as_hex": hex::encode(blob) }))
+                .post_uri("/send_raw_transaction", json!({ "tx_as_hex": hex::encode(blob) }))
                 .map_err(|e| monero_wallet::interface::PublishTransactionError::InterfaceError(InterfaceError::InternalError(e.to_string())))?;
             match res["status"].as_str() {
                 Some("OK") => Ok(()),
