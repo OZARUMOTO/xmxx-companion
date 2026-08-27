@@ -143,8 +143,16 @@ impl DaemonRpc {
         let txs = res["txs"].as_array().ok_or_else(|| anyhow!("get_transactions: no txs"))?;
         let mut out = Vec::with_capacity(txs.len());
         for t in txs {
-            let as_hex = t["as_hex"].as_str().ok_or_else(|| anyhow!("get_transactions: no as_hex"))?;
-            let bytes = hex::decode(as_hex).map_err(|e| anyhow!("tx hex: {e}"))?;
+            // With prune=true the daemon returns the pruned blob in
+            // `pruned_as_hex` and leaves `as_hex` empty; with prune=false
+            // the full tx is in `as_hex`.
+            let as_hex = t["as_hex"].as_str().unwrap_or("");
+            let tx_hex = if as_hex.is_empty() {
+                t["pruned_as_hex"].as_str().unwrap_or("")
+            } else {
+                as_hex
+            };
+            let bytes = hex::decode(tx_hex).map_err(|e| anyhow!("tx hex: {e}"))?;
             let prunable_hash = match t["prunable_hash"].as_str() {
                 Some(h) if !h.is_empty() => {
                     let b = hex::decode(h).map_err(|e| anyhow!("prunable_hash hex: {e}"))?;
