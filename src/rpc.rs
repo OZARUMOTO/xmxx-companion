@@ -85,7 +85,9 @@ impl DaemonRpc {
         if let Some(err) = v.get("error") {
             return Err(anyhow!("rpc {uri} error: {err}"));
         }
-        v.get("result").cloned().ok_or_else(|| anyhow!("rpc {uri}: no result"))
+        // URI endpoints return the response object directly, with no
+        // `result` wrapper (unlike /json_rpc).
+        Ok(v)
     }
 
     /// get_block_count → the number of the latest block (count - 1).
