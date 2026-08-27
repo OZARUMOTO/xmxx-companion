@@ -92,8 +92,8 @@ echo "done. status:"
 systemctl --no-pager status monerod --lines=3 | head -8 || true
 systemctl --no-pager status xmxx-companion --lines=3 | head -8 || true
 echo
-echo "companion page:  http://$(hostname -I | awk '{print $1}'):8787"
-echo "  (the Prime's sync tab scans the QR there; send tab points there too)"
+echo "companion page:  http://$(hostname -I | awk '{print $1}'):8789"
+echo "  (port 8789 — 8787/8788 are taken by surf-relay; the Prime scans the QR there)"
 echo
 echo "monerod sync progress:"
 curl -s -m 5 http://127.0.0.1:18081/json_rpc \

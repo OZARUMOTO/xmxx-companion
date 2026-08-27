@@ -16,7 +16,7 @@ Group=mikegotbtc
 ExecStart=/usr/local/bin/xmxx-companion serve \
   --view-key /etc/xmxx/viewkey.txt \
   --rpc http://127.0.0.1:18081 \
-  --port 8787
+  --port 8789
 Restart=on-failure
 RestartSec=10
 # The first sync can only succeed once monerod is synced past the scan

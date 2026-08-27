@@ -36,7 +36,7 @@ xmxx-companion serve \
   --view-key xmxx-viewkey.txt \
   --rpc http://127.0.0.1:18081 \
   [--from 3500000] \
-  [--port 8787]
+  [--port 8789]
 ```
 
 - `--view-key` — the `address=...` / `view_key=...` file exported from the app
@@ -69,7 +69,8 @@ bash deploy/deploy-box.sh ~/xmxx-viewkey.txt
 That installs monerod (nix binary cache), builds the companion (native ELF),
 installs the units in `deploy/`, and starts `monerod` + `xmxx-companion`.
 The pruned sync runs unattended in the background; the companion page comes
-up immediately and re-syncs on every load.
+up immediately and re-syncs on every load. (On this box, 8787/8788 are
+taken by `surf-relay`, so the companion uses **8789**.)
 
 ## Endpoints
 
