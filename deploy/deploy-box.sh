@@ -52,7 +52,13 @@ else
   command -v monerod || { echo "error: monerod not on PATH after apt install"; exit 1; }
 fi
 MONEROD_BIN=$(command -v monerod)
-echo "    monerod: $MONEROD_BIN"
+# The unit runs monerod as the 'monero' user, who cannot traverse a 0750
+# home dir — copy the binary to /usr/local/bin so it is world-readable.
+if [ "$MONEROD_BIN" != "/usr/local/bin/monerod" ]; then
+  sudo cp "$MONEROD_BIN" /usr/local/bin/monerod
+  echo "    copied monerod to /usr/local/bin/monerod"
+fi
+echo "    monerod: /usr/local/bin/monerod"
 
 echo "==> [3/6] building xmxx-companion (SDK cargo, native ELF)"
 COMPANION_DIR="$HOME/xmxx-companion"
@@ -76,8 +82,7 @@ echo "==> [5/6] installing services"
 sudo useradd -r -M -d /var/lib/monero monero 2>/dev/null || true
 sudo mkdir -p /var/lib/monero
 sudo chown monero:monero /var/lib/monero
-# point the unit at the real monerod path
-sudo sed "s|/usr/local/bin/monerod|$MONEROD_BIN|" "$COMPANION_DIR/deploy/monerod.service" | sudo tee /etc/systemd/system/monerod.service >/dev/null
+sudo cp "$COMPANION_DIR/deploy/monerod.service" /etc/systemd/system/monerod.service
 sudo cp "$COMPANION_DIR/deploy/xmxx-companion.service" /etc/systemd/system/xmxx-companion.service
 sudo systemctl daemon-reload
 sudo systemctl enable monerod xmxx-companion
