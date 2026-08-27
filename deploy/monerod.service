@@ -1,0 +1,34 @@
+# XMXX box — pruned Monero daemon (the "light node").
+#
+# Pruned sync only downloads pruned blocks (~30-40 GB instead of ~170 GB),
+# and a pruned daemon still serves every RPC method the companion needs:
+# get_blocks_by_height, get_transactions, get_o_indexes, get_outs,
+# get_output_distribution, get_fee_estimate, send_raw_transaction.
+#
+# RPC is bound to loopback only — the companion is the only client.
+
+[Unit]
+Description=Monero daemon (pruned, for xmxx-companion)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=monero
+Group=monero
+ExecStart=/usr/local/bin/monerod \
+  --prune-blockchain \
+  --sync-pruned-blocks \
+  --data-dir=/var/lib/monero \
+  --rpc-bind-ip=127.0.0.1 \
+  --rpc-bind-port=18081 \
+  --no-zmq \
+  --non-interactive
+Restart=on-failure
+RestartSec=10
+# monerod writes its log to stderr under systemd
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

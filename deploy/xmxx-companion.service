@@ -1,0 +1,28 @@
+# XMXX companion — the box-side relay the Prime talks to over QR.
+#
+# The view key lives at /etc/xmxx/viewkey.txt (exported from the Prime to
+# the Airlock, then copied here). The device keeps the spend key; the box
+# never holds anything that can spend.
+
+[Unit]
+Description=xmxx-companion (Monero relay for the XMXX KeyOS app)
+After=network-online.target monerod.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mikegotbtc
+Group=mikegotbtc
+ExecStart=/usr/local/bin/xmxx-companion serve \
+  --view-key /etc/xmxx/viewkey.txt \
+  --rpc http://127.0.0.1:18081 \
+  --port 8787
+Restart=on-failure
+RestartSec=10
+# The first sync can only succeed once monerod is synced past the scan
+# height; a failed initial sync is non-fatal (the page re-syncs on load).
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

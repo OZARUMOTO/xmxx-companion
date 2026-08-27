@@ -22,20 +22,54 @@ Requires the nightly-2026-04-11 toolchain (same as the KeyOS SDK shell):
 cargo build --release
 ```
 
+The binary must be a **Linux ELF** to run on the box — build it there with the
+SDK's cargo (the Mac's SDK env produces Mach-O):
+
+```bash
+nix develop ~/.foundation/sdk/current -c cargo build --release
+```
+
 ## Run
 
 ```bash
 xmxx-companion serve \
   --view-key xmxx-viewkey.txt \
-  --rpc https://node.sethforprivacy.com:18089 \
+  --rpc http://127.0.0.1:18081 \
   [--from 3500000] \
   [--port 8787]
 ```
 
 - `--view-key` — the `address=...` / `view_key=...` file exported from the app
-- `--rpc` — any standard Monero daemon JSON-RPC endpoint (remote or local; no
-  node storage needed on the box)
+- `--rpc` — any standard Monero daemon JSON-RPC endpoint (remote or local)
 - `--from` — block height to start scanning from (defaults to the chain tip)
+
+### Node choice: run your own pruned daemon
+
+As of Aug 2026 the public "nodes" that respond (`xmr.support:18089`,
+`xmr-node.cakewallet.com:18081`) are **restricted whitelist gateways** — they
+answer `get_block_count` / `get_block` / `get_output_distribution` /
+`get_fee_estimate` but return `Method not found` for `get_transactions`,
+`get_blocks_by_height`, `get_o_indexes`, `get_outs`, and
+`send_raw_transaction`. The companion's sync/spend path needs all of those, so
+these gateways cannot drive it.
+
+The box therefore runs its own **pruned** `monerod` (≈60 GB, fits the box's
+free space; `--prune-blockchain --sync-pruned-blocks` only downloads pruned
+data). A pruned daemon serves every method the companion calls, keeps queries
+off third parties, and has no public-node dependency. One-shot setup:
+
+```bash
+# on the Mac, copy the view key exported from the Prime:
+scp /Volumes/AIRLOCK/xmxx-viewkey.txt mikegotbtc@<box>:~/xmxx-viewkey.txt
+
+# on the box:
+bash deploy/deploy-box.sh ~/xmxx-viewkey.txt
+```
+
+That installs monerod (nix binary cache), builds the companion (native ELF),
+installs the units in `deploy/`, and starts `monerod` + `xmxx-companion`.
+The pruned sync runs unattended in the background; the companion page comes
+up immediately and re-syncs on every load.
 
 ## Endpoints
 
@@ -56,8 +90,9 @@ signs with its spend key, and the box broadcasts the result.
 - [x] Sync (scan, owned outputs, balance, key-image export)
 - [x] Send (envelope build → device sign → broadcast)
 - [x] Binary-QR transport for large payloads
-- [ ] **Not yet exercised against a live daemon** — first deploy must test
-      against a real node before real funds
+- [ ] **Not yet exercised against a live daemon** — blocked on the box being
+      back online with its pruned node synced; the deploy bundle is staged in
+      `deploy/` and the binary + view-key parse are smoke-tested
 - [ ] wallet2 `unsigned_tx_set` interop (Cake/Feather import) — tracked in
       [xmxx-core](https://github.com/OZARUMOTO/xmxx-core), needs CryptoNight-v0
       + portable_storage parsing
