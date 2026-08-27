@@ -1,0 +1,32 @@
+[package]
+name = "xmxx-core"
+version = "0.2.0"
+edition = "2021"
+description = "OZARUMOTO Monero reference crypto for a foundation monero-signer server: SLIP-0010 derivation, key images, authenticated unsigned/signed tx wire formats. Built on monero-oxide (Cypher Stack audited)."
+license = "GPL-3.0-or-later"
+authors = ["OZARUMOTO"]
+repository = "https://github.com/OZARUMOTO/xmxx-core"
+
+[dependencies]
+# Luke Parker's modern Monero stack (Cypher Stack audit, May 2025): Scalar::hash
+# (sc_reduce32 ∘ keccak256), Point::biased_hash (Monero's ge_fromfe_frombytes_vartime),
+# and the consensus transaction types.
+monero-oxide = "0.1"
+# SignableTransaction: CLSAG + Bulletproof+ signing with on-device ownership
+# verification (input_key * G == P enforced inside sign()).
+monero-wallet = "0.2"
+
+curve25519-dalek = { version = "4", default-features = false, features = ["alloc", "zeroize"] }
+hmac = "0.12"
+sha2 = "0.10"
+tiny-keccak = { version = "2.0", features = ["keccak"] }
+hex = { version = "0.4", default-features = false, features = ["std", "alloc"] }
+rand_core = { version = "0.6", default-features = false, features = ["std"] }
+subtle = { version = "2.5", default-features = false }
+rand_chacha = { version = "0.3", default-features = false }
+zeroize = { version = "1", features = ["derive", "alloc", "zeroize_derive"] }
+
+[dev-dependencies]
+# Independent vetted address encoder (serai) — cross-checks our base58/checksum
+# and subaddress encoding against a separate implementation.
+monero-address = "0.1"

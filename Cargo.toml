@@ -1,0 +1,46 @@
+# SPDX-FileCopyrightText: 2026 OZARUMOTO
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# XMXX-COMPANION — the box-side relay for the xmxx KeyOS app.
+#
+# Talks to a remote Monero daemon JSON-RPC (no local node: the box has
+# almost no free storage) and serves QR pages for the Prime's camera:
+#
+#   /             status: address, balance, owned outputs + sync QR
+#   /send?a=..&p=..   build an unsigned tx (CLSAG/Bulletproof+) -> QR
+#   /broadcast    accept the signed tx hex and publish it
+#
+# The unsigned tx is monero-wallet's SignableTransaction, wrapped in the
+# xmxx-core view-key-authenticated envelope. The device verifies the
+# envelope signature, reviews, signs with its spend key, and returns the
+# signed tx for broadcast.
+#
+# COMPILE-VERIFIED ONLY: the daemon-RPC layer was written against the
+# documented Monero daemon RPC surface and compiled here, but has not yet
+# been exercised against a live node. The JSON shapes are standard and
+# stable; still, first deploy should test each RPC against a real daemon.
+
+[package]
+name = "xmxx-companion"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+curve25519-dalek = { version = "4", default-features = false, features = ["alloc", "zeroize"] }
+futures = { version = "0.3", features = ["executor"] }
+hex = "0.4"
+monero-oxide = "0.1"
+monero-wallet = "0.2"
+qrcode = "0.14"
+rand_chacha = "0.3"
+rand_core = { version = "0.6", default-features = false, features = ["std"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tiny_http = "0.12"
+ureq = { version = "2", features = ["json"] }
+xmxx-core = { path = "xmxx-core" }
+zeroize = { version = "1", features = ["derive"] }
+
+[profile.release]
+opt-level = 2
