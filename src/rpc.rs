@@ -216,6 +216,13 @@ impl DaemonRpc {
             "get_output_distribution",
             json!({
                 "amounts": [0],
+                // `binary` must be explicitly false. monerod defaults to
+                // binary:true here (no sensible JSON default), which returns
+                // `distribution` as a raw binary string instead of the u64
+                // array serde_json can't parse back. With binary:false the
+                // daemon returns the array (LIMIT_NOT_ZERO path); confirmed
+                // against the live 0.18.5.1 daemon.
+                "binary": false,
                 "cumulative": true,
                 "from_height": from,
                 "to_height": to,
