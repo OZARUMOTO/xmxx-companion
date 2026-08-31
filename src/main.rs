@@ -356,15 +356,21 @@ fn handle_send(shared: &Arc<Shared>, to_addr: &str, amount: u64) -> anyhow::Resu
         return Err(anyhow!("no spendable outputs yet — send some XMR to the address first"));
     }
 
-    // Destination address validation + parse.
+    // Destination address validation + parse. Integrated addresses (0x13, with
+    // an 8-byte payment ID) validate, and `dest` carries the payment ID so
+    // SignableTransaction encrypts it into the tx extra automatically.
     if !xmxx_core::wallet::validate_address(to_addr) {
-        return Err(anyhow!("bad destination address"));
+        return Err(anyhow!("bad destination address (must be a monero mainnet address, subaddress, or integrated address)"));
     }
     let dest: monero_wallet::address::MoneroAddress = monero_wallet::address::Address::from_str(
         monero_wallet::address::Network::Mainnet,
         to_addr,
     )
     .map_err(|e| anyhow!("destination parse: {e}"))?;
+    // Surface an embedded payment ID (integrated address) for the review page.
+    let payment_hint = xmxx_core::wallet::integrated_payment_id(to_addr)
+        .map(|id| format!(" · payment id <code>{}</code>", hex::encode(id)))
+        .unwrap_or_default();
 
     // Fee rate from the node.
     let fee_rate = futures::executor::block_on(shared.rpc.fee_rate(FeePriority::Normal, 10_000))
@@ -446,7 +452,7 @@ fn handle_send(shared: &Arc<Shared>, to_addr: &str, amount: u64) -> anyhow::Resu
     Ok(html_page(
         "xmxx send — scan with Prime",
         &format!(
-            "<h2>Send {:.12} XMR</h2><p>to <code>{}</code></p>
+            "<h2>Send {:.12} XMR</h2><p>to <code>{}</code>{payment_hint}</p>
              <p>Fee rate: per-weight (node estimate) · inputs: {} · hold the Prime over the QR → review → sign → then open /broadcast and paste the xmr-txsigned hex.</p>
              <div class='qr'>{}</div>
              <p>hex (fallback): <code style='word-break:break-all'>{}</code></p>",

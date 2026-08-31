@@ -182,6 +182,34 @@ pub fn encode_subaddress(spend_pub: &[u8; 32], view_pub: &[u8; 32]) -> String {
     encode_with_network_byte(0x2A, spend_pub, view_pub)
 }
 
+/// Encode a Monero mainnet INTEGRATED address from spend/view public keys and
+/// an 8-byte (legacy) payment ID.
+///
+/// Integrated addresses use network byte 0x13 (mainnet) plus the 8-byte payment
+/// ID between the public keys and the checksum. They still start with `4` (the
+/// 0x13 byte base58-encodes to a leading `4`), so a wallet that parses standard
+/// addresses accepts the spend/view public keys; the payment ID is carried in
+/// the tx extra when sending. Kept for compatibility with services (some
+/// exchanges/merchants) that still require an integrated address.
+pub fn encode_integrated_address(
+    spend_pub: &[u8; 32],
+    view_pub: &[u8; 32],
+    payment_id: [u8; 8],
+) -> String {
+    use tiny_keccak::Hasher;
+    let mut data = Vec::with_capacity(77);
+    data.push(0x13);
+    data.extend_from_slice(spend_pub);
+    data.extend_from_slice(view_pub);
+    data.extend_from_slice(&payment_id);
+    let mut keccak = tiny_keccak::Keccak::v256();
+    keccak.update(&data);
+    let mut hash = [0u8; 32];
+    keccak.finalize(&mut hash);
+    data.extend_from_slice(&hash[..4]);
+    base58_encode(&data)
+}
+
 fn encode_with_network_byte(network_byte: u8, spend_pub: &[u8; 32], view_pub: &[u8; 32]) -> String {
     use tiny_keccak::Hasher;
 
@@ -201,23 +229,48 @@ fn encode_with_network_byte(network_byte: u8, spend_pub: &[u8; 32], view_pub: &[
 }
 
 /// Validate a Monero mainnet address string (accepts an optional `monero:`
-/// prefix). Accepts standard (0x12) and subaddress (0x2A) network bytes;
-/// checks length and the embedded Keccak checksum.
+/// prefix). Accepts standard (0x12), subaddress (0x2A), and integrated (0x13)
+/// network bytes; checks length and the embedded Keccak checksum.
+///
+/// Standard/subaddress are 69 bytes. Integrated adds an 8-byte payment ID,
+/// so it is 77 bytes.
 pub fn validate_address(addr: &str) -> bool {
     let addr = addr.strip_prefix("monero:").unwrap_or(addr);
     let Some(raw) = base58_decode(addr) else { return false };
-    if raw.len() != 69 {
-        return false;
-    }
-    if raw[0] != 0x12 && raw[0] != 0x2A {
+    let (network_byte, body_len) = match raw.len() {
+        69 => (raw[0], 65),
+        // Integrated: 1 (net) + 32 (spend) + 32 (view) + 8 (payment id) = 73,
+        // then a 4-byte checksum => 77 total.
+        77 => (raw[0], 73),
+        _ => return false,
+    };
+    if network_byte != 0x12 && network_byte != 0x2A && network_byte != 0x13 {
         return false;
     }
     use tiny_keccak::Hasher;
     let mut keccak = tiny_keccak::Keccak::v256();
-    keccak.update(&raw[..65]);
+    keccak.update(&raw[..body_len]);
     let mut hash = [0u8; 32];
     keccak.finalize(&mut hash);
-    raw[65..69] == hash[..4]
+    raw[body_len..body_len + 4] == hash[..4]
+}
+
+/// If `addr` is an integrated mainnet address (network byte 0x13, 77 bytes),
+/// return its 8-byte payment ID. Returns `None` for standard/subaddress
+/// addresses or malformed input. The on-chain destination is the same spend /
+/// view public keys; the payment ID is only carried in the tx extra.
+pub fn integrated_payment_id(addr: &str) -> Option<[u8; 8]> {
+    let addr = addr.strip_prefix("monero:").unwrap_or(addr);
+    if !validate_address(addr) {
+        return None;
+    }
+    let raw = base58_decode(addr)?;
+    if raw.len() != 77 || raw[0] != 0x13 {
+        return None;
+    }
+    let mut id = [0u8; 8];
+    id.copy_from_slice(&raw[65..73]);
+    Some(id)
 }
 
 /// Monero-specific base58 — matches monero/src/common/base58.cpp exactly.
@@ -573,5 +626,49 @@ mod tests {
         assert_eq!(a.address(), b.address());
         assert_eq!(a.spend_public(), b.spend_public());
         assert_eq!(a.spend_mnemonic(), b.spend_mnemonic());
+    }
+
+    /// Integrated addresses validate, carry an 8-byte payment ID retrievable via
+    /// `integrated_payment_id`, and share the spend/view public keys with the
+    /// standard address (the payment ID is a wire/extra field, not a key).
+    #[test]
+    fn integrated_address_round_trip() {
+        let w = MoneroWallet::derive(&[2u8; 32], 0);
+        let payment_id = [0xdeu8, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04];
+
+        let integrated =
+            encode_integrated_address(&w.spend_public(), &w.view_public(), payment_id);
+        assert!(validate_address(&integrated), "integrated address must validate");
+        assert!(integrated.len() >= 95);
+        assert_eq!(integrated_payment_id(&integrated), Some(payment_id));
+
+        // The raw bytes: network byte 0x13, 77 bytes with the 8-byte payment id.
+        let raw = base58_decode(&integrated).unwrap();
+        assert_eq!(raw.len(), 77);
+        assert_eq!(raw[0], 0x13);
+        assert_eq!(&raw[1..33], &w.spend_public(), "embedded spend pubkey");
+        assert_eq!(&raw[33..65], &w.view_public(), "embedded view pubkey");
+        assert_eq!(&raw[65..73], &payment_id, "payment id bytes");
+
+        // A standard address yields None for integrated_payment_id.
+        assert_eq!(integrated_payment_id(w.address()), None);
+        // A subaddress yields None too.
+        assert_eq!(integrated_payment_id(&w.subaddress(0, 0)), None);
+    }
+
+    /// Tampered integrated address (payment-id byte) fails validation.
+    #[test]
+    fn tampered_integrated_address_rejected() {
+        let w = MoneroWallet::derive(&[2u8; 32], 0);
+        let integrated =
+            encode_integrated_address(&w.spend_public(), &w.view_public(), [1u8; 8]);
+        assert!(validate_address(&integrated));
+
+        // Flip one payment-id character via raw bytes round-trip.
+        let mut raw = base58_decode(&integrated).unwrap();
+        raw[65] ^= 0x01;
+        let reencoded = base58_encode(&raw);
+        assert!(!validate_address(&reencoded), "tampered integrated address must not validate");
+        assert_eq!(integrated_payment_id(&reencoded), None);
     }
 }

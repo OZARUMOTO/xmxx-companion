@@ -25,6 +25,10 @@ rand_core = { version = "0.6", default-features = false, features = ["std"] }
 subtle = { version = "2.5", default-features = false }
 rand_chacha = { version = "0.3", default-features = false }
 zeroize = { version = "1", features = ["derive", "alloc", "zeroize_derive"] }
+# Authenticated encryption for the destinations region of the xmr-txunsigned
+# envelope (recipient + amount confidentiality on the wire). The key is derived
+# from the wallet's private view key, so only the companion + device can read it.
+chacha20poly1305 = "0.10"
 
 [dev-dependencies]
 # Independent vetted address encoder (serai) — cross-checks our base58/checksum

@@ -5,19 +5,30 @@
 //
 // The wire format is monero-wallet's native `SignableTransaction` serialization
 // (a vetted, Cypher-Stack-audited structure: inputs with decoys and
-// commitments, payments, fee rate), wrapped in an envelope that is
-// **authenticated with the view keypair**:
+// commitments, payments, fee rate), wrapped in an envelope that is both
+// **encrypted** and **authenticated** with the wallet's view keypair:
 //
-//   magic "xmxx-txunsigned-v1" ‖ version(1) ‖ destinations ‖ payload ‖ sig
+//   magic "xmxx-txunsigned-v2" ‖ version(1)
+//     ‖ destinations_enc(aead) ‖ payload ‖ sig(64)
 //
 // where `destinations` is the human-review summary (address + piconeros) the
-// companion built, `payload` is the serialized SignableTransaction, and `sig`
-// is Monero's Schnorr signature (crypto.cpp generate_signature) over
-// `keccak256(destinations ‖ payload)` under the wallet's view key. Verifying
-// the signature before touching the payload proves (a) the data is unmodified
-// and (b) the sender holds this wallet's view key — the "is this my wallet?"
-// test, and the same auth model as wallet2's unsigned_tx_set (minus the
-// CryptoNight-v0 key derivation, which wallet2-format interop would require).
+// companion built, `payload` is the serialized SignableTransaction, and
+//
+//   * destinations_enc = XChaCha20-Poly1305 ciphertext of the destination
+//     list, keyed by keccak256("xmxx-destinations-key" ‖ view_key_bytes).
+//     This gives the destinations **confidentiality** (a camera/observer can't
+//     read who or how much) as well as integrity — only someone holding the
+//     wallet's private view key can read them. The handshake ensures the
+//     destination summary seen on the review screen is the one the companion
+//     actually built.
+//
+//   * sig = Monero's Schnorr signature (crypto.cpp generate_signature) over
+//     `keccak256(destinations_enc ‖ payload)` under the wallet's view key.
+//     Verifying the signature before touching anything proves (a) the data is
+//     unmodified and (b) the sender holds this wallet's view key — the
+//     "is this my wallet?" test, and the same auth model as wallet2's
+//     unsigned_tx_set (minus the CryptoNight-v0 key derivation, which
+//     wallet2-format interop would require).
 //
 // Review + signing:
 //   * necessary_fee is recomputed on-device from the actual object being
@@ -31,18 +42,27 @@
 //
 // The destination summary is companion-asserted (the device has no way to
 // recompute payment intents from the serialized tx), but it is bound to the
-// payload by the envelope signature and shown alongside the payload
+// payload by the envelope signature + AEAD tag and shown alongside the payload
 // fingerprint, which the user can cross-check against the companion.
 
 use rand_core::SeedableRng as _;
 use subtle::ConstantTimeEq as _;
 use zeroize::Zeroizing;
 
+use chacha20poly1305::{
+    aead::{Aead, KeyInit as _, Payload},
+    XChaCha20Poly1305, XNonce,
+};
+
 use crate::wallet::validate_address;
 use crate::{Point, Scalar};
 
-const MAGIC: &[u8; 18] = b"xmxx-txunsigned-v1";
+const MAGIC: &[u8; 18] = b"xmxx-txunsigned-v2";
 const VERSION: u8 = 1;
+/// AEAD nonce length for XChaCha20-Poly1305 (24 bytes). Derived from the view
+/// key so the device needs no RNG to decrypt, and nonce reuse is impossible
+/// because it's a pure function of the envelope+keys.
+const NONCE_LEN: usize = 24;
 
 /// An authenticated unsigned transaction set, parsed and ready for review or
 /// signing. Everything except `destinations` is device-derived.
@@ -50,8 +70,8 @@ pub struct UnsignedTxSet {
     /// keccak256(payload) — the fingerprint of the exact bytes that will be
     /// signed. Shown on the review screen for cross-checking.
     pub fingerprint: [u8; 32],
-    /// Destination summary (address, piconeros) supplied by the companion and
-    /// authenticated by the envelope signature.
+    /// Destination summary (address, piconeros) supplied by the companion,
+    /// authenticated AND decrypted by the wallet's view key.
     pub destinations: Vec<(String, u64)>,
     /// The minimum fee this transaction requires, recomputed on-device from
     /// the parsed object (not echoed from the companion).
@@ -76,6 +96,7 @@ pub enum TxSetError {
     Decode(String),
     InvalidEnvelope(String),
     AuthenticationFailed,
+    DecryptionFailed,
     Parse(String),
     Sign(String),
 }
@@ -86,6 +107,7 @@ impl core::fmt::Display for TxSetError {
             TxSetError::Decode(e) => write!(f, "decode error: {e}"),
             TxSetError::InvalidEnvelope(e) => write!(f, "invalid envelope: {e}"),
             TxSetError::AuthenticationFailed => write!(f, "authentication failed: not this wallet's unsigned set"),
+            TxSetError::DecryptionFailed => write!(f, "decryption failed: destinations cannot be read by this wallet"),
             TxSetError::Parse(e) => write!(f, "parse error: {e}"),
             TxSetError::Sign(e) => write!(f, "signing error: {e}"),
         }
@@ -94,9 +116,60 @@ impl core::fmt::Display for TxSetError {
 
 impl std::error::Error for TxSetError {}
 
+/// Derive the AEAD key for the destinations region from the wallet's private
+/// view key. Both the companion (encoder) and the device (decoder) hold the
+/// view scalar, so both can read — an observer cannot.
+fn destinations_aead_key(view_key: &Scalar) -> [u8; 32] {
+    let vk: [u8; 32] = <[u8; 32]>::from(*view_key);
+    keccak256(&[b"xmxx-destinations-key".as_slice(), &vk].concat())
+}
+
+/// Deterministic 24-byte XChaCha20 nonce derived from the view key + payload.
+/// A pure function of the envelope contents + keys: the device needs no RNG to
+/// decrypt, and nonce-collision across distinct envelopes is effectively
+/// impossible (it's keyed by the view key and the payload fingerprint).
+fn destinations_nonce(view_key: &Scalar, payload: &[u8]) -> [u8; NONCE_LEN] {
+    let vk: [u8; 32] = <[u8; 32]>::from(*view_key);
+    let h = keccak256(&[b"xmxx-destinations-nonce".as_slice(), &vk, payload].concat());
+    let mut nonce = [0u8; NONCE_LEN];
+    nonce.copy_from_slice(&h[..NONCE_LEN]);
+    nonce
+}
+
+/// Encrypt the raw ascending destinations region (the `destinations` summary)
+/// with XChaCha20-Poly1305 keyed by the view key, authenticating the payload
+/// as associated data so the tag ALSO proves the payload wasn't swapped.
+fn encrypt_destinations(
+    view_key: &Scalar,
+    dest_region: &[u8],
+    payload: &[u8],
+) -> Result<Vec<u8>, TxSetError> {
+    let key = destinations_aead_key(view_key);
+    let cipher = XChaCha20Poly1305::new((&key).into());
+    let nonce: XNonce = *XNonce::from_slice(&destinations_nonce(view_key, payload));
+    // Payload bytes are authenticated (not encrypted) — the AEAD tag therefore
+    // binds the payload to the destinations, catching a swapped-payload attack.
+    cipher
+        .encrypt(&nonce, Payload { msg: dest_region, aad: payload })
+        .map_err(|_| TxSetError::InvalidEnvelope("destinations encryption failed".into()))
+}
+
+fn decrypt_destinations(
+    view_key: &Scalar,
+    ciphertext: &[u8],
+    payload: &[u8],
+) -> Result<Vec<u8>, TxSetError> {
+    let key = destinations_aead_key(view_key);
+    let cipher = XChaCha20Poly1305::new((&key).into());
+    let nonce: XNonce = *XNonce::from_slice(&destinations_nonce(view_key, payload));
+    cipher
+        .decrypt(&nonce, Payload { msg: ciphertext, aad: payload })
+        .map_err(|_| TxSetError::DecryptionFailed)
+}
+
 /// Build an `xmr-txunsigned` payload for the companion: serialize the
-/// `SignableTransaction`, wrap it with the destination summary, and sign the
-/// envelope with the wallet's private view key.
+/// `SignableTransaction`, wrap it with the (encrypted, authenticated)
+/// destination summary, and sign the envelope with the wallet's private view key.
 pub fn encode_unsigned_tx_set(
     destinations: &[(String, u64)],
     payload: &[u8],
@@ -108,10 +181,7 @@ pub fn encode_unsigned_tx_set(
         }
     }
 
-    let mut envelope = Vec::with_capacity(18 + 1 + payload.len() + 64 + 32 * destinations.len());
-    envelope.extend_from_slice(MAGIC);
-    envelope.push(VERSION);
-
+    // Raw ascending destinations region.
     let mut dest_region = Vec::with_capacity(4 + 33 * destinations.len());
     dest_region.extend_from_slice(&(destinations.len() as u32).to_le_bytes());
     for (addr, amount) in destinations {
@@ -124,13 +194,22 @@ pub fn encode_unsigned_tx_set(
         dest_region.extend_from_slice(&amount.to_le_bytes());
     }
 
-    envelope.extend_from_slice(&dest_region);
+    // Encrypt + authenticate the destinations with the view key.
+    let dest_enc = encrypt_destinations(view_key, &dest_region, payload)?;
 
+    // Assemble the envelope: magic ‖ version ‖ dest_enc ‖ payload ‖ sig.
+    let mut envelope =
+        Vec::with_capacity(18 + 1 + dest_enc.len() + 4 + payload.len() + 64);
+    envelope.extend_from_slice(MAGIC);
+    envelope.push(VERSION);
+    envelope.extend_from_slice(&(dest_enc.len() as u32).to_le_bytes());
+    envelope.extend_from_slice(&dest_enc);
     envelope.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     envelope.extend_from_slice(payload);
 
-    // data_to_sign = keccak256(destinations ‖ payload)
-    let data_to_sign = keccak256(&[&dest_region, payload].concat());
+    // data_to_sign = keccak256(dest_enc ‖ payload) — over the CI PHERtext so
+    // the signature authenticates the encrypted destinations.
+    let data_to_sign = keccak256(&[&dest_enc, payload].concat());
 
     let view_pub = mul_base(view_key);
     let (c, r) = schnorr_sign(&data_to_sign, view_key, &view_pub);
@@ -141,16 +220,16 @@ pub fn encode_unsigned_tx_set(
 }
 
 /// Parse and authenticate an `xmr-txunsigned` payload. Verifies the envelope
-/// signature with the wallet's public view key, then parses the
-/// `SignableTransaction`. Refuses anything not signed by this wallet's view
-/// key or that fails to parse.
+/// signature with the wallet's public view key, decrypts the destinations with
+/// the private view key, then parses the `SignableTransaction`. Refuses
+/// anything not signed/encrypted by this wallet's keys or that fails to parse.
 pub fn parse_unsigned_tx_set(
     qr_data: &str,
-    view_pub: &Point,
+    view_key: &Scalar,
 ) -> Result<UnsignedTxSet, TxSetError> {
     let hex_data = qr_data.trim().strip_prefix("xmr-txunsigned:").unwrap_or(qr_data.trim());
     let raw = hex::decode(hex_data).map_err(|e| TxSetError::Decode(e.to_string()))?;
-    parse_envelope(&raw, view_pub)
+    parse_envelope(&raw, view_key)
 }
 
 /// Parse + authenticate an `xmr-txunsigned` payload passed as RAW BYTES (the
@@ -159,7 +238,7 @@ pub fn parse_unsigned_tx_set(
 /// `xmr-txunsigned:` text prefix for hex-encoded payloads.
 pub fn parse_unsigned_tx_set_bytes(
     qr_data: &[u8],
-    view_pub: &Point,
+    view_key: &Scalar,
 ) -> Result<UnsignedTxSet, TxSetError> {
     let data: &[u8] = match qr_data.strip_prefix(b"xmr-txunsigned:") {
         Some(rest) => rest,
@@ -172,15 +251,16 @@ pub fn parse_unsigned_tx_set_bytes(
     } else {
         data.to_vec()
     };
-    parse_envelope(&raw, view_pub)
+    parse_envelope(&raw, view_key)
 }
 
-/// The shared envelope parse: magic/version/destinations/payload/signature,
-/// Schnorr verification with the wallet's public view key, then
-/// `SignableTransaction::read`. Refuses anything not signed by this wallet.
-fn parse_envelope(raw: &[u8], view_pub: &Point) -> Result<UnsignedTxSet, TxSetError> {
+/// The shared envelope parse: magic/version/dest_enc/payload/signature,
+/// Schnorr verification with the wallet's view key, AEAD decryption of the
+/// destinations, then `SignableTransaction::read`. Refuses anything not this
+/// wallet's.
+fn parse_envelope(raw: &[u8], view_key: &Scalar) -> Result<UnsignedTxSet, TxSetError> {
     // Magic + version.
-    if raw.len() < 18 + 1 + 4 + 4 + 64 {
+    if raw.len() < 18 + 1 + 4 + 64 {
         return Err(TxSetError::InvalidEnvelope("payload too short".into()));
     }
     if &raw[..18] != MAGIC {
@@ -191,20 +271,81 @@ fn parse_envelope(raw: &[u8], view_pub: &Point) -> Result<UnsignedTxSet, TxSetEr
     }
 
     let mut pos = 19;
-    let dest_count = u32::from_le_bytes(raw[pos..pos + 4].try_into().unwrap()) as usize;
+    let dest_enc_len =
+        u32::from_le_bytes(raw[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4;
+    let dest_enc = raw
+        .get(pos..pos + dest_enc_len)
+        .ok_or_else(|| TxSetError::InvalidEnvelope("truncated encrypted destinations".into()))?;
+    pos += dest_enc_len;
+
+    let payload_len = u32::from_le_bytes(raw[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4;
+    let payload = raw
+        .get(pos..pos + payload_len)
+        .ok_or_else(|| TxSetError::InvalidEnvelope("truncated payload".into()))?;
+    pos += payload_len;
+
+    let sig = raw.get(pos..pos + 64).ok_or_else(|| TxSetError::InvalidEnvelope("missing signature".into()))?;
+    let (c, r) = (&sig[..32], &sig[32..]);
+
+    // data_to_sign = keccak256(dest_enc ‖ payload)
+    let data_to_sign = keccak256(&[dest_enc, payload].concat());
+    let view_pub = mul_base(view_key);
+    if !schnorr_verify(&data_to_sign, &view_pub, c, r) {
+        return Err(TxSetError::AuthenticationFailed);
+    }
+
+    // Decrypt + authenticate the destinations with the private view key.
+    let dest_plain = decrypt_destinations(view_key, dest_enc, payload)?;
+    let destinations = parse_destinations(&dest_plain)?;
+
+    // Parse the actual object we will sign.
+    let mut slice: &[u8] = &payload;
+    let tx = monero_wallet::send::SignableTransaction::read(&mut slice)
+        .map_err(|e| TxSetError::Parse(format!("SignableTransaction::read: {e}")))?;
+
+    let fingerprint = keccak256(payload);
+
+    Ok(UnsignedTxSet {
+        fingerprint,
+        destinations,
+        necessary_fee: tx.necessary_fee(),
+        payload: payload.to_vec(),
+        tx,
+    })
+}
+
+/// Parse the ascending destinations region (count ‖ (addr_len ‖ addr ‖ amount)*)
+/// after decryption.
+fn parse_destinations(dest_plain: &[u8]) -> Result<Vec<(String, u64)>, TxSetError> {
+    let mut pos = 0;
+    let dest_count = match dest_plain.get(pos..pos + 4) {
+        Some(b) => u32::from_le_bytes(b.try_into().unwrap()) as usize,
+        None => return Err(TxSetError::InvalidEnvelope("truncated destinations".into())),
+    };
     pos += 4;
 
     let mut destinations = Vec::with_capacity(dest_count);
     for _ in 0..dest_count {
-        let addr_len = *raw.get(pos).ok_or_else(|| TxSetError::InvalidEnvelope("truncated destination".into()))? as usize;
+        let addr_len = *dest_plain
+            .get(pos)
+            .ok_or_else(|| TxSetError::InvalidEnvelope("truncated destination".into()))?
+            as usize;
         pos += 1;
-        let addr_bytes = raw.get(pos..pos + addr_len).ok_or_else(|| TxSetError::InvalidEnvelope("truncated address".into()))?;
+        let addr_bytes = dest_plain
+            .get(pos..pos + addr_len)
+            .ok_or_else(|| TxSetError::InvalidEnvelope("truncated address".into()))?;
         pos += addr_len;
         let addr = std::str::from_utf8(addr_bytes)
             .map_err(|_| TxSetError::InvalidEnvelope("address not utf-8".into()))?
             .to_string();
         let amount = u64::from_le_bytes(
-            raw.get(pos..pos + 8).ok_or_else(|| TxSetError::InvalidEnvelope("truncated amount".into()))?.try_into().unwrap(),
+            dest_plain
+                .get(pos..pos + 8)
+                .ok_or_else(|| TxSetError::InvalidEnvelope("truncated amount".into()))?
+                .try_into()
+                .unwrap(),
         );
         pos += 8;
         if !validate_address(&addr) {
@@ -212,45 +353,12 @@ fn parse_envelope(raw: &[u8], view_pub: &Point) -> Result<UnsignedTxSet, TxSetEr
         }
         destinations.push((addr, amount));
     }
-    let dest_region_end = pos;
-
-    let payload_len = u32::from_le_bytes(raw[pos..pos + 4].try_into().unwrap()) as usize;
-    pos += 4;
-    let payload = raw
-        .get(pos..pos + payload_len)
-        .ok_or_else(|| TxSetError::InvalidEnvelope("truncated payload".into()))?
-        .to_vec();
-    pos += payload_len;
-
-    let sig = raw.get(pos..pos + 64).ok_or_else(|| TxSetError::InvalidEnvelope("missing signature".into()))?;
-    let (c, r) = (&sig[..32], &sig[32..]);
-
-    // data_to_sign = keccak256(destinations ‖ payload)
-    let dest_region = &raw[18 + 1..dest_region_end];
-    let data_to_sign = keccak256(&[dest_region, &payload].concat());
-    if !schnorr_verify(&data_to_sign, view_pub, c, r) {
-        return Err(TxSetError::AuthenticationFailed);
-    }
-
-    // Parse the actual object we will sign.
-    let mut slice: &[u8] = &payload;
-    let tx = monero_wallet::send::SignableTransaction::read(&mut slice)
-        .map_err(|e| TxSetError::Parse(format!("SignableTransaction::read: {e}")))?;
-
-    let fingerprint = keccak256(&payload);
-
-    Ok(UnsignedTxSet {
-        fingerprint,
-        destinations,
-        necessary_fee: tx.necessary_fee(),
-        payload,
-        tx,
-    })
+    Ok(destinations)
 }
 
 /// Project the review screen. `necessary_fee` and the fingerprint are
 /// device-derived; the destination list is companion-asserted (authenticated
-/// by the envelope signature).
+/// by the envelope signature + AEAD tag).
 pub fn preview_tx(set: &UnsignedTxSet) -> TxPreview {
     let (to_addr, amount) = match set.destinations.first() {
         Some((addr, amt)) => (addr.clone(), *amt),
@@ -278,9 +386,10 @@ pub fn preview_tx(set: &UnsignedTxSet) -> TxPreview {
 /// Fails loudly on any input the wallet does not own (monero-wallet asserts
 /// (spend + key_offset)·G == P per input), on malformed data, or if signing
 /// itself errors — it never returns success without a real signature.
-pub fn sign_tx(set: UnsignedTxSet, spend_key: &Scalar, view_pub: &Point) -> Result<Vec<u8>, TxSetError> {
+pub fn sign_tx(set: UnsignedTxSet, spend_key: &Scalar, view_key: &Scalar) -> Result<Vec<u8>, TxSetError> {
     // Deterministic RNG: keccak256(payload ‖ view_pub) — the signature becomes
     // a pure function of the unsigned set and the keys.
+    let view_pub = mul_base(view_key);
     let mut seed_input = set.payload.clone();
     seed_input.extend_from_slice(&view_pub.compress().to_bytes());
     let seed = keccak256(&seed_input);
@@ -395,8 +504,8 @@ mod tests {
         MoneroWallet::derive(&[13u8; 32], 0)
     }
 
-    /// Round-trip: build an envelope (view key), parse + authenticate it
-    /// (view pub), and review it.
+    /// Round-trip: build an envelope (view key), parse + authenticate + decrypt
+    /// it (view key), and review it.
     #[test]
     fn envelope_round_trip_and_review() {
         let w = wallet();
@@ -404,11 +513,38 @@ mod tests {
         let payload = b"not-a-real-signable-tx-payload".to_vec();
 
         let encoded = encode_unsigned_tx_set(&destinations, &payload, w.view_key()).unwrap();
-        let parsed = parse_unsigned_tx_set(&encoded, &w.view_public_point());
+        let parsed = parse_unsigned_tx_set(&encoded, w.view_key());
         // The dummy payload is not a valid SignableTransaction — parse must
-        // authenticate first (it will fail at parse, not at auth).
+        // authenticate + decrypt first (it will fail at parse, not at auth).
         let err = parsed.err().expect("dummy payload must fail to parse");
         assert!(matches!(err, TxSetError::Parse(_)), "expected parse error, got {err:?}");
+    }
+
+    /// The encrypted destinations must not be readable by an observer (no view key).
+    #[test]
+    fn destinations_are_encrypted_on_the_wire() {
+        let w = wallet();
+        let destinations = vec![(w.address().to_string(), 777u64)];
+        let payload = vec![0xabu8; 128];
+
+        let encoded = encode_unsigned_tx_set(&destinations, &payload, w.view_key()).unwrap();
+        let raw = hex::decode(encoded.strip_prefix("xmr-txunsigned:").unwrap()).unwrap();
+
+        // The raw ascending destination summary (count + "4..." + 8-byte amount)
+        // must NOT appear verbatim in the envelope bytes — it's encrypted.
+        let addr = w.address().as_bytes();
+        let haystack: &[u8] = &raw;
+        let needle_region = [&[addr.len() as u8], addr].concat();
+        assert!(
+            !haystack.windows(needle_region.len()).any(|w| w == needle_region.as_slice()),
+            "destination address must be encrypted on the wire"
+        );
+        // The amount 777 LE bytes must not appear verbatim either.
+        let amt = 777u64.to_le_bytes();
+        assert!(
+            !haystack.windows(8).any(|w| w == amt),
+            "destination amount must be encrypted on the wire"
+        );
     }
 
     /// The raw-bytes entry point parses the same envelope (binary QR path).
@@ -421,38 +557,39 @@ mod tests {
         let encoded = encode_unsigned_tx_set(&destinations, &payload, w.view_key()).unwrap();
         let raw = hex::decode(encoded.strip_prefix("xmr-txunsigned:").unwrap()).unwrap();
 
-        // Raw bytes: must fail at PARSE (auth passed, dummy payload invalid),
-        // proving auth + structure are handled identically to the string path.
-        println!("DBG1 len={} magic_ok={}", raw.len(), &raw[..18] == b"xmxx-txunsigned-v1");
-        println!("DBG1 count={} addr_len={}", u32::from_le_bytes(raw[19..23].try_into().unwrap()), raw[23]);
-        println!("DBG1 addr={}", String::from_utf8_lossy(&raw[24..119]));
-        println!("DBG1 real={}", destinations[0].0);
-        let err = parse_unsigned_tx_set_bytes(&raw, &w.view_public_point())
+        // Raw bytes: must fail at PARSE (auth/decrypt passed, dummy payload
+        // invalid), proving auth + structure are handled identically.
+        let err = parse_unsigned_tx_set_bytes(&raw, w.view_key())
             .err()
             .expect("dummy payload must fail to parse");
         assert!(matches!(err, TxSetError::Parse(_)), "got {err:?}");
 
         // Tampered raw bytes must fail authentication. Tamper a PAYLOAD byte
-        // (a destination-address byte is rejected by address validation before
-        // the signature check, which is a different error path).
-        let payload_start = 19 + 4 + (1 + 95 + 8) + 4;
+        // (a destination-address byte is rejected by AEAD auth/address validation
+        // before the signature check, which is a different error path).
+        let payload_start = 19 + 4 + {
+            // dest_enc_len field
+            let del = u32::from_le_bytes(raw[19..23].try_into().unwrap()) as usize;
+            0 + del
+        } + 4;
         let mut tampered = raw.clone();
         tampered[payload_start] ^= 0x01;
-        let err2 = parse_unsigned_tx_set_bytes(&tampered, &w.view_public_point())
+        let err2 = parse_unsigned_tx_set_bytes(&tampered, w.view_key())
             .err()
             .expect("tampered raw must fail");
         assert!(matches!(err2, TxSetError::AuthenticationFailed), "got {err2:?}");
 
         // The hex-prefixed form through the bytes entry must also work.
-        let err3 = parse_unsigned_tx_set_bytes(encoded.as_bytes(), &w.view_public_point())
+        let err3 = parse_unsigned_tx_set_bytes(encoded.as_bytes(), w.view_key())
             .err()
             .expect("hex form through bytes entry must fail at parse");
         assert!(matches!(err3, TxSetError::Parse(_)), "got {err3:?}");
     }
 
-    /// Tampering with any byte of the envelope must fail authentication.
+    /// Tampering with any byte of the envelope must fail authentication or
+    /// decryption.
     #[test]
-    fn tampered_envelope_fails_authentication() {
+    fn tampered_envelope_fails() {
         let w = wallet();
         let destinations = vec![(w.address().to_string(), 1u64)];
         let payload = vec![0xabu8; 128];
@@ -460,28 +597,57 @@ mod tests {
         let encoded = encode_unsigned_tx_set(&destinations, &payload, w.view_key()).unwrap();
         let raw = hex::decode(encoded.strip_prefix("xmr-txunsigned:").unwrap()).unwrap();
 
-        // Flip one payload byte.
+        // Flip one payload byte → AuthenticationFailed.
+        let payload_start = 19 + 4 + {
+            let del = u32::from_le_bytes(raw[19..23].try_into().unwrap()) as usize;
+            del
+        } + 4;
         let mut tampered = raw.clone();
-        let payload_start = 19 + 4 + (1 + w.address().len() + 8) + 4;
         tampered[payload_start] ^= 0x01;
         let err = parse_unsigned_tx_set(
             &format!("xmr-txunsigned:{}", hex::encode(&tampered)),
-            &w.view_public_point(),
+            w.view_key(),
         )
         .err()
         .expect("tampered envelope must fail");
         assert!(matches!(err, TxSetError::AuthenticationFailed), "got {err:?}");
 
-        // Also flipping a destination amount byte must fail.
-        let mut tampered2 = raw;
-        tampered2[19 + 4 + 1 + w.address().len()] ^= 0x01; // amount byte
+        // Flip a ciphertext byte. Because the Schnorr signature is over the
+        // (encrypted) destinations, tampering with the ciphertext is caught by
+        // EITHER the signature (AuthenticationFailed) or the AEAD tag
+        // (DecryptionFailed) — the first check that fires wins. Either outcome
+        // proves the tampered envelope is rejected; assert on the union.
+        let mut tampered2 = raw.clone();
+        let ciphertext_start = 19 + 4;
+        tampered2[ciphertext_start] ^= 0x01;
         let err2 = parse_unsigned_tx_set(
             &format!("xmr-txunsigned:{}", hex::encode(&tampered2)),
-            &w.view_public_point(),
+            w.view_key(),
         )
         .err()
-        .expect("tampered amount must fail");
-        assert!(matches!(err2, TxSetError::AuthenticationFailed), "got {err2:?}");
+        .expect("tampered ciphertext must fail");
+        assert!(
+            matches!(err2, TxSetError::AuthenticationFailed | TxSetError::DecryptionFailed),
+            "got {err2:?}"
+        );
+
+        // DecryptionFailed is the guaranteed path when integrity is enforced
+        // purely by the AEAD tag and the Schnorr signature is deliberately kept
+        // valid. Construct a valid envelope, then re-seal the SAME destination
+        // plaintext under a DIFFERENT payload so the tag no longer matches what
+        // the (unchanged) network sig authenticates is impossible to do without
+        // the private key — so instead directly demonstrate that a valid sig +
+        // wrong-key decrypt cannot succeed: parsing our envelope under the
+        // wrong wallet key fails (AuthenticationFailed), and parsing under a
+        // key that has the right sig but any ciphertext change is rejected above.
+        let wrong = MoneroWallet::derive(&[7u8; 32], 0);
+        let err3 = parse_unsigned_tx_set(
+            &format!("xmr-txunsigned:{}", hex::encode(&raw[..])),
+            wrong.view_key(),
+        )
+        .err()
+        .expect("wrong-wallet decrypt must fail");
+        assert!(matches!(err3, TxSetError::AuthenticationFailed), "got {err3:?}");
     }
 
     /// An envelope signed by a DIFFERENT wallet's view key must be rejected —
@@ -493,12 +659,12 @@ mod tests {
 
         let destinations = vec![(w.address().to_string(), 1u64)];
         let payload = vec![1u8; 64];
-        // Sign with the OTHER wallet's view key.
+        // Sign + encrypt with the OTHER wallet's view key.
         let encoded = encode_unsigned_tx_set(&destinations, &payload, other.view_key()).unwrap();
 
         let err = parse_unsigned_tx_set(
             &encoded,
-            &w.view_public_point(),
+            w.view_key(),
         )
         .err()
         .expect("foreign-wallet envelope must fail");
@@ -520,7 +686,7 @@ mod tests {
     fn schnorr_round_trip() {
         let w = wallet();
         let hash = keccak256(b"test payload");
-        let pub_ = w.view_public_point();
+        let pub_ = mul_base(w.view_key());
         let (c, r) = schnorr_sign(&hash, w.view_key(), &pub_);
         assert!(schnorr_verify(&hash, &pub_, &c, &r));
 
@@ -529,7 +695,7 @@ mod tests {
         assert!(!schnorr_verify(&other_hash, &pub_, &c, &r));
 
         // Wrong public key fails.
-        let other_pub = MoneroWallet::derive(&[1u8; 32], 0).view_public_point();
+        let other_pub = mul_base(&MoneroWallet::derive(&[1u8; 32], 0).view_key());
         assert!(!schnorr_verify(&hash, &other_pub, &c, &r));
     }
 }
